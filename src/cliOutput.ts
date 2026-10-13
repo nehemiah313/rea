@@ -1,3 +1,4 @@
+import { explicitBooleanArgumentError } from "./cli/explicitBooleanArguments.js";
 const UNSUPPORTED_OUTPUT_COMBINATION_MESSAGE =
   "Token windows cannot preserve structured output. Remove --token-limit/--token-offset and use --filter-output or command pagination.";
 
@@ -9,7 +10,10 @@ export type CliOutputArgumentValidation =
   | {
       readonly ok: false;
       readonly format: StructuredOutputFormat;
-      readonly code: "UNSUPPORTED_OUTPUT_COMBINATION" | "INVALID_OUTPUT_FILTER";
+      readonly code:
+        | "UNSUPPORTED_OUTPUT_COMBINATION"
+        | "INVALID_OUTPUT_FILTER"
+        | "VALIDATION_ERROR";
       readonly message: string;
     };
 
@@ -114,6 +118,15 @@ export const validateCliOutputArguments = (
   const { filterOutput, format, parseError, tokenWindow } =
     parseCliOutputArguments(arguments_);
   if (parseError) return { ok: true };
+  const doctorError = validateDoctorPresentationArguments(arguments_);
+  if (doctorError !== undefined)
+    return {
+      ok: false,
+      format: format === "yaml" || format === "jsonl" ? format : "json",
+      code: "VALIDATION_ERROR",
+      message: doctorError,
+    };
+
   if (filterOutput !== undefined && hasUnclosedFilterSlice(filterOutput))
     return {
       ok: false,
@@ -161,4 +174,59 @@ export const renderCliOutputArgumentError = (
   if (error.format === "yaml")
     return `ok: false\nerror:\n  code: ${error.code}\n  message: ${JSON.stringify(error.message)}\n`;
   return `${JSON.stringify(value)}\n`;
+};
+
+/** Preserve raw boolean values before Incur's permissive string coercion. */
+const validateDoctorPresentationArguments = (
+  args: readonly string[],
+): string | undefined => {
+  const valued = new Set([
+    "--format",
+    "--filter-output",
+    "--token-limit",
+    "--token-offset",
+    "--target",
+    "--client",
+    "--provider",
+    "--deadline-ms",
+  ]);
+  const booleans = new Set(["summary", "failuresOnly", "human", "skill"]);
+  let doctor = false;
+  let human = false;
+  let incompatible = false;
+  const invalid = explicitBooleanArgumentError(args, booleans, valued);
+  for (let i = 0; i < args.length; i += 1) {
+    const argument = args[i]!;
+    if (argument === "--help" || argument === "-h") return undefined;
+    if (argument === "doctor") doctor = true;
+    if (
+      argument === "--json" ||
+      argument === "--format" ||
+      argument === "--full-output" ||
+      argument === "--filter-output" ||
+      argument === "--token-count" ||
+      argument === "--token-limit" ||
+      argument === "--token-offset"
+    )
+      incompatible = true;
+    const equals = argument.indexOf("=");
+    const flag = equals < 0 ? argument : argument.slice(0, equals);
+    const name = flag
+      .slice(2)
+      .replace(/-([a-z])/gu, (_, character: string) => character.toUpperCase());
+    if (booleans.has(name)) {
+      const value = equals < 0 ? "true" : argument.slice(equals + 1);
+
+      if (flag === "--human") human = value === "true";
+    }
+    if (argument === "--no-human") human = false;
+    if (valued.has(argument)) i += 1;
+  }
+  if (!doctor) return undefined;
+  return (
+    invalid ??
+    (human && incompatible
+      ? "--human cannot be combined with formatting, filtering, envelope, or token-output options."
+      : undefined)
+  );
 };

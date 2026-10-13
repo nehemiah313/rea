@@ -64,17 +64,28 @@ export const scopeDoctorChecks = (
     ({ name }) =>
       name === "node" || (input.scope.target !== null && name === "target"),
   );
-  const clientChecks = input.scope.clients.map((client) =>
-    selectedRegistrationCheck(
-      client,
-      input.registrations.find((candidate) => candidate.client === client),
-    ),
+  const clientChecks = input.scope.clients.map(
+    (client) =>
+      input.checks.find(
+        (check) =>
+          check.name === `registration:${client}` &&
+          check.classification === "diagnostic_incomplete",
+      ) ??
+      selectedRegistrationCheck(
+        client,
+        input.registrations.find((candidate) => candidate.client === client),
+      ),
   );
   const skillChecks = input.scope.skill
     ? [selectedSkillCheck(input.skillState, input.checks)]
     : [];
   const selectedProviderChecks = input.scope.providers.flatMap((providerId) =>
-    selectedProviderChecksFor(providerId, providerChecks, input.providers),
+    selectedProviderChecksFor(
+      providerId,
+      providerChecks,
+      input.providers,
+      input.checks,
+    ),
   );
   const hopperHostChecks = input.scope.providers.includes("hopper")
     ? input.checks.filter(({ name }) => name === "host")
@@ -112,7 +123,15 @@ const selectedProviderChecksFor = (
   providerId: string,
   checks: readonly DoctorCheck[],
   providers: DoctorProviderState,
+  allChecks: readonly DoctorCheck[],
 ): readonly DoctorCheck[] => {
+  const incomplete = allChecks.find(
+    ({ name, classification }) =>
+      name === "provider:inspection" &&
+      classification === "diagnostic_incomplete",
+  );
+  if (providerId !== "hopper" && incomplete !== undefined)
+    return [{ ...incomplete, name: `provider:${providerId}` }];
   const selected = checks.filter(({ name }) =>
     providerId === "hopper"
       ? name.startsWith("hopper")

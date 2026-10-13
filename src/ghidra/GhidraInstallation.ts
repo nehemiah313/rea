@@ -704,7 +704,7 @@ const javaRemediation = (
     : `Update JAVA_HOME to the root of ${range} installation.`;
 };
 
-const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
+export const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
   readText(path) {
     try {
       // Ghidra loads this file with Properties.load(InputStream), which maps
@@ -747,54 +747,48 @@ const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
     }
   },
   probeJava(command, environment) {
-    const observed = spawnSync(
-      command,
-      [
-        "-Dstdout.encoding=UTF-8",
-        "-Dstderr.encoding=UTF-8",
-        // JDK 17/18 use the legacy names; JDK 19+ use the names above.
-        "-Dsun.stdout.encoding=UTF-8",
-        "-Dsun.stderr.encoding=UTF-8",
-        "-XX:-UsePerfData",
-        "-XshowSettings:properties",
-        "-version",
-      ],
-      {
-        encoding: "utf8",
-        env: environment,
-        timeout: 5_000,
-        maxBuffer: Number.POSITIVE_INFINITY,
-        windowsHide: true,
-      },
-    );
+    const observed = spawnSync(command, GHIDRA_JAVA_PROBE_ARGUMENTS, {
+      encoding: "utf8",
+      env: environment,
+      timeout: 5_000,
+      maxBuffer: Number.POSITIVE_INFINITY,
+      windowsHide: true,
+    });
     if (observed.error !== undefined || observed.status !== 0) return undefined;
     const output = `${observed.stdout ?? ""}\n${observed.stderr ?? ""}`;
-    const version = javaProperty(output, "java.version");
-    const home = javaProperty(output, "java.home");
-    const vmName = javaProperty(output, "java.vm.name");
-    const bits = Number.parseInt(
-      javaProperty(output, "sun.arch.data.model") ?? "0",
-      10,
-    );
-    if (version === null || home === null) return undefined;
-    return {
-      version,
-      major: javaMajor(version),
-      home,
-      ...(vmName === null ? {} : { vmName }),
-      bits,
-      runtime: executablePath(
-        (process.platform === "win32" ? win32 : posix).join(
-          home,
-          "bin",
-          process.platform === "win32" ? "javac.exe" : "javac",
-        ),
-      )
-        ? "jdk"
-        : "jre",
-    };
+    return parseGhidraJavaObservation(output);
   },
 });
+
+/** Parse the same Java facts for synchronous discovery and cancellable doctor probes. */
+export const parseGhidraJavaObservation = (
+  output: string,
+): GhidraJavaObservation | undefined => {
+  const version = javaProperty(output, "java.version");
+  const home = javaProperty(output, "java.home");
+  const vmName = javaProperty(output, "java.vm.name");
+  const bits = Number.parseInt(
+    javaProperty(output, "sun.arch.data.model") ?? "0",
+    10,
+  );
+  if (version === null || home === null) return undefined;
+  return {
+    version,
+    major: javaMajor(version),
+    home,
+    ...(vmName === null ? {} : { vmName }),
+    bits,
+    runtime: executablePath(
+      (process.platform === "win32" ? win32 : posix).join(
+        home,
+        "bin",
+        process.platform === "win32" ? "javac.exe" : "javac",
+      ),
+    )
+      ? "jdk"
+      : "jre",
+  };
+};
 
 const executablePath = (path: string): boolean => {
   try {
@@ -818,3 +812,14 @@ const javaMajor = (version: string): number => {
   if (first !== 1) return first;
   return Number.parseInt(version.split(".")[1] ?? "0", 10);
 };
+
+/** Target-free Java settings probe; disables performance-data writes. */
+export const GHIDRA_JAVA_PROBE_ARGUMENTS = [
+  "-Dstdout.encoding=UTF-8",
+  "-Dstderr.encoding=UTF-8",
+  "-Dsun.stdout.encoding=UTF-8",
+  "-Dsun.stderr.encoding=UTF-8",
+  "-XX:-UsePerfData",
+  "-XshowSettings:properties",
+  "-version",
+] as const;

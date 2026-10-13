@@ -148,6 +148,108 @@ A scoped report has `scope.mode: "explicit"`. Its `scope_checks` determine
 `environment_healthy` summarizes the full audit. `--target` adds a target check,
 but the report remains audit-wide unless a scope option is also supplied.
 
+### Compact diagnostic reports
+
+Use `--summary` for a small readiness response, or `--failures-only` to retain
+only failed checks with their original details and remediation:
+
+```bash
+rea doctor --client codex --summary --json
+rea doctor --provider ghidra --failures-only --json
+```
+
+Both views retain `healthy`, `environment_healthy` and `scope`. Their
+`check_counts.scope` and `check_counts.informational` contain `total`, `passed`
+and `failed` counts from the unfiltered report. `report_view` identifies the
+selected view. Summary reports omit diagnostic arrays and installation identity;
+failure-only reports include filtered `scope_checks` and `informational_checks`
+without the duplicate full-audit `checks` array.
+
+An empty `scope_checks` array in a failure-only report means no required checks
+failed, not that no checks ran. Informational failures remain visible but do not
+change a healthy explicit scope's exit status. If both flags are supplied,
+`--failures-only` takes precedence and still includes summary counts. These flags
+change presentation only: all normal probes and cleanup still run, no host
+configuration is changed, and exit statuses are unchanged. Omit both flags to
+retrieve the complete original report and identity observations.
+
+Compact reports carry `report_contract_version: 1`. Named runtime and JSON
+schemas are available in `src/contracts/doctorReportSchemas.ts`; MCP compact
+schemas are in `src/contracts/mcpDoctorReportSchemas.ts`. Summary and
+failure-only tags are distinct contracts. Invalid explicit booleans, such as
+`--summary=invalid`, are rejected before diagnosis. Bare flags and
+`=true`/`=false` remain supported.
+
+Audit-wide failed counts describe individual diagnostics, **not readiness
+blockers**: an absent unconfigured Hopper can be reported while an available
+Ghidra satisfies the audit's engine requirement. Explicit scopes and exit
+statuses retain their existing semantics.
+
+### Human-readable diagnosis
+
+Use an opt-in plain-text report for a terminal or redirected text file:
+
+```bash
+rea doctor --client codex --human
+rea doctor --provider ghidra --human --failures-only
+rea doctor --client codex --human --summary
+```
+
+Human output leads with selected-scope readiness, separates blockers from
+optional findings, and groups identical remediation text with the checks it
+addresses. It emits no colors and never applies repairs. Summary mode omits
+details and points to the full report. Do not combine `--human` with JSON,
+explicit formats, envelopes, filtering, or token-output selectors; these
+combinations fail before probing. Without `--human`, default output is unchanged.
+
+### Deadlines, incomplete checks, and cancellation
+
+```bash
+rea doctor --client codex --deadline-ms 5000 --failures-only --json
+rea mcp doctor --deadline-ms 5000 --summary --json
+```
+
+`--deadline-ms` accepts a positive timer-safe integer (up to 2147483647).
+Completed checks are retained when probing stops. Interrupted probes carry
+`execution_status: "timed_out"` or `"cancelled"`; later stages are
+`"not_examined"`. These are incomplete observations, not passed checks or
+missing dependencies. Local reports include `execution` completion metadata;
+MCP reports include `incomplete` metadata identifying unexamined stages;
+`dependency_failed` identifies stages skipped after a prerequisite failed.
+Local identity observations preserve completed facts and label only the
+interrupted sub-observations as incomplete or unknown.
+Compact counts add `incomplete` when nonzero and satisfy
+`total = passed + failed + incomplete`.
+
+A timed-out required check cannot establish readiness. Optional incomplete
+checks do not invalidate an explicit scope already established as ready, but
+the full environment audit remains incomplete. SIGINT/SIGTERM request
+cooperative cancellation and retain conventional interruption exit codes.
+Owned child processes and resources are closed before a response is returned.
+**The deadline bounds probing, not cleanup**; supervised stop grace and
+non-preemptible filesystem work can extend wall-clock completion. No process
+or promise is abandoned simply to meet a displayed deadline.
+
+### MCP diagnostic presentation
+
+```bash
+rea mcp doctor --summary --json
+rea mcp doctor --failures-only --json --full-output
+rea mcp doctor --human --summary
+```
+
+The existing MCP diagnostic supports the same view flags and failure-only
+precedence, plus deadlines and human output. Compact MCP reports retain their
+production-stdio adapter identity, original counts, and failed or incomplete
+diagnostic evidence. `--full-output` wraps compact results in `{ok,data}` or
+`{ok,error}`; legacy no-view output remains unchanged. Help and invalid arguments
+never launch a diagnostic child.
+
+`rea mcp doctor` starts a **fresh production stdio server** and checks startup,
+canonical inventories, server identity, and a target-free `binary_session`
+request. It does not inspect the server already running inside Codex or Cursor;
+check that server through the active client's own `binary_session` request.
+
 Follow the remediation for the failed check. If a native target has several
 available providers, choose one with `--provider` on the CLI or `provider_id`
 on `open_binary`. A `capability_unavailable` failure carries
