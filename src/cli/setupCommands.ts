@@ -2,7 +2,7 @@ import { z } from "incur";
 
 import type { DoctorScope } from "../application/Doctor.js";
 import { DOCTOR_PROVIDER_IDS } from "../application/DoctorProviderIds.js";
-import { projectDoctorReport } from "../application/DoctorReportView.js";
+import { withCommandCancellation } from "./commandCancellation.js";
 import {
   isSetupFailure,
   type SetupOptions,
@@ -129,21 +129,65 @@ const registerDoctorCommand = (
         .boolean()
         .default(false)
         .describe("Return only failed checks with remediation and full counts"),
+      human: z
+        .boolean()
+        .default(false)
+        .describe("Print plain-language readiness and grouped next steps"),
+      deadlineMs: z
+        .number()
+        .int()
+        .positive()
+        .max(2_147_483_647)
+        .optional()
+        .describe(
+          "Diagnostic deadline in milliseconds; cleanup is still awaited",
+        ),
     }),
-    run: ({ options }) =>
-      logCliCommand(logger, "doctor", async () => {
-        const [{ runDoctorOwned }, { createSystemDoctorHost }] =
-          await Promise.all([
+    run: async ({ options, formatExplicit }) => {
+      if (options.human && formatExplicit)
+        throw new Error(
+          "--human cannot be combined with an explicit output format.",
+        );
+      const result = await withCommandCancellation(async (signal) =>
+        logCliCommand(logger, "doctor", async () => {
+          const [
+            { runDoctorOwned, getDoctorReadiness },
+            { createSystemDoctorHost },
+            { projectDoctorReport },
+          ] = await Promise.all([
             import("../application/Doctor.js"),
             import("../doctorRuntime.js"),
+            import("../application/DoctorReportView.js"),
           ]);
-        const report = await runDoctorOwned(
-          options.target,
-          createSystemDoctorHost(environment),
-          doctorScope(options),
-        );
-        return projectDoctorReport(report, options);
-      }),
+          const execute = () =>
+            runDoctorOwned(
+              options.target,
+              createSystemDoctorHost(environment),
+              doctorScope(options),
+              {
+                ...(options.deadlineMs === undefined
+                  ? {}
+                  : { deadlineMs: options.deadlineMs }),
+                signal,
+              },
+            );
+          const report = await execute();
+          if (options.human) {
+            const { renderDoctorHumanReport } =
+              await import("../application/DoctorHumanReport.js");
+            const text = renderDoctorHumanReport(
+              report,
+              options,
+              getDoctorReadiness(report),
+            );
+            process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+            return report;
+          }
+          return projectDoctorReport(report, options);
+        }),
+      );
+      return options.human ? undefined : result;
+    },
   });
 };
 

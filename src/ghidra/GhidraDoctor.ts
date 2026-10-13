@@ -1,3 +1,5 @@
+import { execFileOutput } from "../process/ExecFileOutput.js";
+import { isAbsolute, join } from "node:path";
 import type {
   DoctorProviderCheck,
   DoctorProviderInspection,
@@ -8,6 +10,10 @@ import {
 } from "../process/WindowsAuthority.js";
 import {
   inspectGhidraInstallation,
+  ghidraJavaEnvironment,
+  systemGhidraInstallationHost,
+  parseGhidraJavaObservation,
+  GHIDRA_JAVA_PROBE_ARGUMENTS,
   type GhidraInstallationCheck,
   type GhidraInstallationInspection,
 } from "./GhidraInstallation.js";
@@ -58,22 +64,64 @@ export const projectGhidraDoctorInspection = (
 };
 
 /** Inspect the process-configured BYO Ghidra installation for `rea doctor`. */
-export const inspectSystemGhidraProvider = (
+export const inspectSystemGhidraProvider = async (
   environment: Readonly<NodeJS.ProcessEnv>,
-): Promise<DoctorProviderInspection> =>
-  Promise.resolve(
-    projectGhidraDoctorInspection(
-      inspectGhidraInstallation({
-        environment,
-        ...(environment.GHIDRA_INSTALL_DIR === undefined
-          ? {}
-          : { installDir: environment.GHIDRA_INSTALL_DIR }),
-        ...(environment.JAVA_HOME === undefined
-          ? {}
-          : { javaHome: environment.JAVA_HOME }),
-      }),
-    ),
+  signal?: AbortSignal,
+): Promise<DoctorProviderInspection> => {
+  const options = {
+    environment,
+    ...(environment.GHIDRA_INSTALL_DIR === undefined
+      ? {}
+      : { installDir: environment.GHIDRA_INSTALL_DIR }),
+    ...(environment.JAVA_HOME === undefined
+      ? {}
+      : { javaHome: environment.JAVA_HOME }),
+  };
+  if (signal === undefined)
+    return projectGhidraDoctorInspection(inspectGhidraInstallation(options));
+  const host = systemGhidraInstallationHost();
+  let java: ReturnType<typeof parseGhidraJavaObservation>;
+  if (
+    environment.JAVA_HOME === undefined ||
+    isAbsolute(environment.JAVA_HOME)
+  ) {
+    const command =
+      environment.JAVA_HOME === undefined
+        ? process.platform === "win32"
+          ? "java.exe"
+          : "java"
+        : join(
+            environment.JAVA_HOME,
+            "bin",
+            process.platform === "win32" ? "java.exe" : "java",
+          );
+    try {
+      const output = await execFileOutput(
+        command,
+        GHIDRA_JAVA_PROBE_ARGUMENTS,
+        {
+          env: ghidraJavaEnvironment(
+            environment.JAVA_HOME,
+            environment,
+            process.platform,
+          ),
+          signal,
+          stopSignal: "SIGTERM",
+          timeout: 5_000,
+          windowsHide: true,
+        },
+      );
+      java = parseGhidraJavaObservation(`${output.stdout}\n${output.stderr}`);
+    } catch (cause: unknown) {
+      if (signal.aborted) throw cause;
+      java = undefined;
+    }
+  }
+  signal.throwIfAborted();
+  return projectGhidraDoctorInspection(
+    inspectGhidraInstallation(options, { ...host, probeJava: () => java }),
   );
+};
 
 const selectedChecks = (
   inspection: GhidraInstallationInspection,

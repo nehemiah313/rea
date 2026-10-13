@@ -59,6 +59,7 @@ cliTest(
     const compact = await run(["--summary"]);
     expect(compact.exitCode).toBe(result.exitCode);
     const compactReport = compact.json as DoctorReportSummary;
+    expect(compactReport.report_contract_version).toBe(1);
     expect(compactReport).toMatchObject({
       report_view: "summary",
       healthy: report.healthy,

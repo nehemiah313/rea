@@ -42,6 +42,7 @@ describe("doctor report views", () => {
     });
     expect(projectDoctorReport(report, summary)).toEqual({
       report_view: "summary",
+      report_contract_version: 1,
       healthy: true,
       environment_healthy: false,
       scope: report.scope,
@@ -59,6 +60,7 @@ describe("doctor report views", () => {
     const original = structuredClone(report);
     expect(projectDoctorReport(report, failures)).toEqual({
       report_view: "failures-only",
+      report_contract_version: 1,
       healthy: true,
       environment_healthy: false,
       scope: report.scope,
@@ -138,5 +140,49 @@ describe("doctor report views", () => {
     expect(
       projectDoctorReport(report, { summary: true, failuresOnly: true }),
     ).toEqual(projectDoctorReport(report, failures));
+  });
+
+  it("preserves execution metadata and counts incomplete checks separately", async () => {
+    const base = await runDoctor(undefined, createDoctorHostFixture());
+    const report = {
+      ...base,
+      execution: {
+        complete: false,
+        stop_reason: "deadline" as const,
+        deadline_ms: 500,
+      },
+      scope_checks: base.scope_checks.map((check, index) =>
+        index === 0
+          ? { ...check, ok: false, execution_status: "timed_out" as const }
+          : check,
+      ),
+    };
+
+    expect(projectDoctorReport(report, summary)).toMatchObject({
+      report_view: "summary",
+      report_contract_version: 1,
+      execution: report.execution,
+      check_counts: {
+        scope: {
+          total: base.scope_checks.length,
+          passed: base.scope_checks.length - 1,
+          failed: 0,
+          incomplete: 1,
+        },
+      },
+    });
+    expect(projectDoctorReport(report, failures)).toMatchObject({
+      scope_checks: [
+        expect.objectContaining({ execution_status: "timed_out" }),
+      ],
+      check_counts: {
+        scope: {
+          total: base.scope_checks.length,
+          passed: base.scope_checks.length - 1,
+          failed: 0,
+          incomplete: 1,
+        },
+      },
+    });
   });
 });

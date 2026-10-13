@@ -261,10 +261,15 @@ export const systemLinuxHopperInstallHost = (
 /** Match the Linux Hopper build validated by the packaged demo-dialog adapter. */
 export const linuxHopperBinarySupported = async (
   path: string,
+  signal?: AbortSignal,
 ): Promise<boolean> => {
   try {
     const hash = createHash("sha256");
-    for await (const chunk of createReadStream(path)) hash.update(chunk);
+    for await (const chunk of createReadStream(
+      path,
+      signal === undefined ? {} : { signal },
+    ))
+      hash.update(chunk);
     return linuxHopperLauncherDigestSupported(hash.digest("hex"));
   } catch (cause: unknown) {
     // best-effort cleanup: optional build probing; unreadable means unsupported.

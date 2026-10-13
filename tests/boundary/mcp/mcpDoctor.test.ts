@@ -37,10 +37,10 @@ describe("production MCP doctor", () => {
       },
       request_flow: { tool: "binary_session", ok: true },
     });
-    expect(result.inventory?.tools.expected).toBe(
-      result.inventory?.tools.observed,
+    expect(result.inventory?.tools?.expected).toBe(
+      result.inventory?.tools?.observed,
     );
-    expect(result.inventory?.tools.expected).toBe(
+    expect(result.inventory?.tools?.expected).toBe(
       CATALOG_IDENTITY.counts.mcp_tools,
     );
   }, 30_000);
@@ -85,6 +85,44 @@ describe("production MCP doctor", () => {
       await client.close();
       await transport.close();
     }
+    // Completed peers remain visible when a later stage reaches its deadline.
+    for (const mode of ["tools-hang", "request-hang", "tools-error"]) {
+      const result = await runProductionMcpDoctor({
+        command: process.execPath,
+        args: [
+          resolve("tests/fixtures/mcpDoctorReply.mjs"),
+          snapshotPath,
+          mode,
+        ],
+        cwd: process.cwd(),
+        environment,
+        deadlineMs: 700,
+      });
+      expect(result.healthy).toBe(false);
+      expect(result.checks).toContainEqual(
+        expect.objectContaining({ name: "initialize", ok: true }),
+      );
+      expect(result.checks).toContainEqual(
+        expect.objectContaining({ name: "inventory:prompts", ok: true }),
+      );
+      expect(result.incomplete?.reason).toBe(
+        mode === "tools-error" ? "dependency_failed" : "timeout",
+      );
+      expect(result.inventory?.prompts?.observed).toBe(
+        CATALOG_IDENTITY.counts.mcp_prompts,
+      );
+      if (mode === "request-hang") {
+        expect(result.checks).toContainEqual(
+          expect.objectContaining({ name: "inventory:tools", ok: true }),
+        );
+        expect(result.checks).toContainEqual(
+          expect.objectContaining({
+            name: "server-identity",
+            execution_status: "not_examined",
+          }),
+        );
+      }
+    }
     // Replay real production metadata through a synthetic stdio producer.
     for (const mode of ["valid", "invalid"]) {
       const result = await runProductionMcpDoctor({
@@ -98,10 +136,10 @@ describe("production MCP doctor", () => {
         environment,
       });
       expect(result.healthy).toBe(mode === "valid");
-      expect(result.inventory?.tools.observed).toBe(
+      expect(result.inventory?.tools?.observed).toBe(
         CATALOG_IDENTITY.counts.mcp_tools,
       );
-      expect(result.inventory?.prompts.observed).toBe(
+      expect(result.inventory?.prompts?.observed).toBe(
         CATALOG_IDENTITY.counts.mcp_prompts,
       );
       expect(result.checks).toContainEqual({
@@ -117,7 +155,9 @@ describe("production MCP doctor", () => {
         });
     }
   }, 30_000);
+});
 
+describe("production MCP doctor startup failures", () => {
   it("reports exact missing, unexpected, and duplicate inventory names", () => {
     expect(compareInventory(["a", "b"], ["b", "c", "c"])).toEqual({
       expected: 2,
@@ -142,7 +182,9 @@ describe("production MCP doctor", () => {
       diagnostics: { stderr: expect.stringContaining("startup exit") },
     });
   });
+});
 
+describe("production MCP doctor deadline cleanup", () => {
   it("kills a child that misses the absolute startup deadline", async () => {
     const root = await createTestTempDirectory("rea-mcp-doctor-");
     const pidPath = join(root, "pid");
@@ -169,8 +211,46 @@ describe("production MCP doctor", () => {
     vi.useRealTimers();
     expect(result.healthy).toBe(false);
     expect(result.checks[0]?.detail).toMatch(/deadline|abort|timed/iu);
+    expect(result.incomplete).toEqual({
+      reason: "timeout",
+      not_examined: expect.arrayContaining([
+        "initialize",
+        "inventory:tools",
+        "inventory:prompts",
+        "server-identity",
+        "request-flow",
+      ]),
+    });
     await expect(waitForExit(pid)).resolves.toBeUndefined();
   }, 10_000);
+});
+
+describe("MCP doctor final owned-child exit", () => {
+  it("awaits SIGKILL exit for a child that ignores polite shutdown", async () => {
+    if (process.platform === "win32") return;
+    const root = await createTestTempDirectory("rea-mcp-stubborn-");
+    const pidPath = join(root, "pid");
+    const result = await runProductionMcpDoctor({
+      command: process.execPath,
+      args: [resolve("tests/fixtures/mcpDoctorHang.mjs")],
+      cwd: process.cwd(),
+      environment: {
+        ...process.env,
+        REA_MCP_DOCTOR_PID_PATH: pidPath,
+        REA_MCP_DOCTOR_IGNORE_TERM: "1",
+      },
+      deadlineMs: 500,
+    });
+    const pid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
+    expect(result.healthy).toBe(false);
+    // Doctor completion itself establishes exit; no eventual-exit polling.
+    expect(() => process.kill(pid, 0)).toThrow(
+      expect.objectContaining({ code: "ESRCH" }),
+    );
+    expect(result.checks).not.toContainEqual(
+      expect.objectContaining({ name: "cleanup" }),
+    );
+  }, 15_000);
 });
 
 const waitForExit = async (pid: number): Promise<void> => {

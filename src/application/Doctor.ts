@@ -1,4 +1,9 @@
 import { constants } from "node:fs";
+import {
+  DoctorExecution,
+  type DoctorExecutionOptions,
+  type DoctorExecutionReport,
+} from "./DoctorExecution.js";
 import { access, readdir, stat } from "node:fs/promises";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
@@ -34,6 +39,7 @@ import {
 import {
   collectDoctorDiagnostics,
   doctorHealthy,
+  doctorBlockingChecks,
 } from "./DoctorDiagnostics.js";
 import {
   normalizeDoctorScope,
@@ -51,7 +57,13 @@ export interface DoctorCheck {
     | "unsupported_host"
     | "unsupported_target"
     | "missing_analysis_engine"
-    | "config_drift";
+    | "config_drift"
+    | "diagnostic_incomplete";
+  readonly execution_status?:
+    | "completed"
+    | "timed_out"
+    | "cancelled"
+    | "not_examined";
   readonly detail?: string;
   readonly details?: Readonly<Record<string, JsonValue>>;
   readonly remediation?: string;
@@ -86,24 +98,34 @@ export interface DoctorHost {
   readonly homeDirectory: string;
   readonly configuredHopperPath?: string;
   readonly configuredIlspyCmdPath?: string;
-  macosVersion(): Promise<string | undefined>;
-  linuxDistribution(): Promise<LinuxDistribution | undefined>;
-  validTarget(path: string): Promise<boolean>;
+  macosVersion(signal?: AbortSignal): Promise<string | undefined>;
+  linuxDistribution(
+    signal?: AbortSignal,
+  ): Promise<LinuxDistribution | undefined>;
+  validTarget(path: string, signal?: AbortSignal): Promise<boolean>;
   /** Route-specific target admission details, when supplied by the host. */
-  inspectTarget?(path: string): Promise<DoctorCheck>;
-  executable(path: string): Promise<boolean>;
-  supportedLinuxHopper(path: string): Promise<boolean>;
-  linuxDemoRuntimeCheck(): Promise<DoctorCheck>;
-  brewHopperPath(): Promise<string | undefined>;
-  manualHopperPaths(): Promise<readonly string[]>;
-  providerInspections?(): Promise<readonly DoctorProviderInspection[]>;
-  installationPaths?(): Promise<readonly string[]>;
+  inspectTarget?(path: string, signal?: AbortSignal): Promise<DoctorCheck>;
+  executable(path: string, signal?: AbortSignal): Promise<boolean>;
+  supportedLinuxHopper(path: string, signal?: AbortSignal): Promise<boolean>;
+  linuxDemoRuntimeCheck(signal?: AbortSignal): Promise<DoctorCheck>;
+  brewHopperPath(signal?: AbortSignal): Promise<string | undefined>;
+  manualHopperPaths(signal?: AbortSignal): Promise<readonly string[]>;
+  providerInspections?(
+    signal?: AbortSignal,
+  ): Promise<readonly DoctorProviderInspection[]>;
+  installationPaths?(signal?: AbortSignal): Promise<readonly string[]>;
   installedSkillIdentity?(
     clientIds: readonly string[],
+    signal?: AbortSignal,
   ): Promise<InstalledSkillIdentity | undefined>;
   close?(): Promise<string | undefined>;
-  clientRegistrations?(): Promise<readonly ClientRegistrationStatus[]>;
-  ilspyCmdVersion?(path: string): Promise<string | undefined>;
+  clientRegistrations?(
+    signal?: AbortSignal,
+  ): Promise<readonly ClientRegistrationStatus[]>;
+  ilspyCmdVersion?(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined>;
 }
 
 /** Structured result returned by the read-only doctor workflow. */
@@ -117,6 +139,7 @@ export interface DoctorReport {
   readonly providerInspections?: readonly DoctorProviderInspection[];
   readonly checks: readonly DoctorCheck[];
   readonly identity?: DoctorIdentity;
+  readonly execution?: DoctorExecutionReport;
 }
 
 /** Caller-selected readiness boundary; omitted values retain audit semantics. */
@@ -144,10 +167,15 @@ interface DoctorIdentity {
   readonly skill: {
     readonly installed_version: string | null;
     readonly installed_tool_count: number | null;
-    readonly state: "aligned" | "stale" | "missing";
+    readonly state: "aligned" | "stale" | "missing" | "unknown";
     readonly remediation: string | null;
   };
   readonly registrations: readonly ClientRegistrationStatus[];
+  readonly observations?: {
+    readonly registrations: "completed" | "incomplete";
+    readonly skill: "completed" | "incomplete";
+    readonly installations: "completed" | "incomplete";
+  };
 }
 
 /**
@@ -159,20 +187,37 @@ export const runDoctor = async (
   target?: string,
   selectedHost?: DoctorHost,
   requestedScope?: DoctorScope,
+  executionOptions?: DoctorExecutionOptions,
 ): Promise<DoctorReport> =>
   selectedHost === undefined
-    ? runDoctorOwned(target, systemDoctorHost(), requestedScope)
-    : inspectDoctor(target, selectedHost, requestedScope);
+    ? runDoctorOwned(
+        target,
+        systemDoctorHost(),
+        requestedScope,
+        executionOptions,
+      )
+    : inspectDoctorWithExecution(
+        target,
+        selectedHost,
+        requestedScope,
+        executionOptions,
+      );
 
 /** Inspect with a host whose lifetime belongs to this operation. */
 export const runDoctorOwned = async (
   target: string | undefined,
   host: DoctorHost,
   requestedScope?: DoctorScope,
+  executionOptions?: DoctorExecutionOptions,
 ): Promise<DoctorReport> => {
   let report: DoctorReport;
   try {
-    report = await inspectDoctor(target, host, requestedScope);
+    report = await inspectDoctorWithExecution(
+      target,
+      host,
+      requestedScope,
+      executionOptions,
+    );
   } catch (cause: unknown) {
     const cleanup = await closeDoctorHost(host);
     if (cleanup !== undefined)
@@ -189,18 +234,55 @@ export const runDoctorOwned = async (
     : doctorReportWithCleanup(report, cleanup);
 };
 
+const inspectDoctorWithExecution = async (
+  target: string | undefined,
+  host: DoctorHost,
+  requestedScope: DoctorScope | undefined,
+  options: DoctorExecutionOptions | undefined,
+): Promise<DoctorReport> => {
+  const execution =
+    options === undefined ? undefined : new DoctorExecution(options);
+  try {
+    return await inspectDoctor(target, host, requestedScope, execution);
+  } finally {
+    execution?.close();
+  }
+};
+
+export interface DoctorReadiness {
+  readonly blockerChecks: readonly DoctorCheck[];
+  readonly optionalChecks: readonly DoctorCheck[];
+}
+const reportReadiness = new WeakMap<DoctorReport, DoctorReadiness>();
+/** Aggregation-owned applicability without changing the legacy serialized report. */
+export const getDoctorReadiness = (report: DoctorReport): DoctorReadiness =>
+  reportReadiness.get(report) ?? {
+    blockerChecks: report.healthy
+      ? []
+      : report.scope_checks.filter(({ ok }) => !ok),
+    optionalChecks: report.healthy
+      ? report.checks.filter(({ ok }) => !ok)
+      : report.informational_checks.filter(({ ok }) => !ok),
+  };
+
 const inspectDoctor = async (
   target: string | undefined,
   host: DoctorHost,
   requestedScope?: DoctorScope,
+  execution?: DoctorExecution,
 ): Promise<DoctorReport> => {
   const scope = normalizeDoctorScope(requestedScope, target);
+  const earlyIdentity =
+    execution?.bounded !== true
+      ? undefined
+      : await collectDoctorIdentity(host, scope, execution);
   const {
     checks: diagnosticChecks,
     hopperPath,
     providerInspections,
-  } = await collectDoctorDiagnostics(target, host);
-  const identity = await collectDoctorIdentity(host, scope);
+  } = await collectDoctorDiagnostics(target, host, execution);
+  const identity =
+    earlyIdentity ?? (await collectDoctorIdentity(host, scope, execution));
   const checks = [...diagnosticChecks, ...identity.checks];
   const providers = {
     hopperAvailable:
@@ -214,12 +296,12 @@ const inspectDoctor = async (
   const environmentHealthy = doctorHealthy(checks, providers);
   const scoped = scopeDoctorChecks({
     checks,
-    registrations: identity.value.registrations,
-    skillState: identity.value.skill.state,
+    registrations: identity.registrations,
+    skillState: identity.skillState,
     providers,
     scope,
   });
-  return {
+  const report: DoctorReport = {
     healthy: scope.mode === "audit-wide" ? environmentHealthy : scoped.healthy,
     environment_healthy: environmentHealthy,
     scope,
@@ -229,8 +311,23 @@ const inspectDoctor = async (
     ...(hopperPath === undefined ? {} : { hopperPath }),
     ...(providerInspections === undefined ? {} : { providerInspections }),
     checks,
-    identity: identity.value,
+    ...(identity.value === undefined ? {} : { identity: identity.value }),
+    ...(execution === undefined ||
+    (execution.report().complete && execution.report().deadline_ms === null)
+      ? {}
+      : { execution: execution.report() }),
   };
+  const blockers =
+    scope.mode === "explicit"
+      ? report.scope_checks.filter(({ ok }) => !ok)
+      : doctorBlockingChecks(checks, providers);
+  reportReadiness.set(report, {
+    blockerChecks: blockers,
+    optionalChecks: checks.filter(
+      (candidate) => !candidate.ok && !blockers.includes(candidate),
+    ),
+  });
+  return report;
 };
 
 const closeDoctorHost = async (
@@ -254,35 +351,87 @@ const doctorReportWithCleanup = (
     detail,
     remediation: "Resolve the reported cleanup failure, then rerun rea doctor.",
   };
-  return {
+  const updated: DoctorReport = {
     ...report,
     healthy: false,
     environment_healthy: false,
     checks: [...report.checks, check],
     scope_checks: [...report.scope_checks, check],
   };
+  reportReadiness.set(updated, {
+    ...getDoctorReadiness(report),
+    blockerChecks: [...getDoctorReadiness(report).blockerChecks, check],
+  });
+  return updated;
 };
 
 const collectDoctorIdentity = async (
   host: DoctorHost,
   scope: DoctorScopeReport,
+  execution?: DoctorExecution,
 ): Promise<{
   readonly checks: readonly DoctorCheck[];
   readonly value: DoctorIdentity;
+  readonly registrations: readonly ClientRegistrationStatus[];
+  readonly skillState: "aligned" | "missing" | "stale";
 }> => {
-  const installationPaths = (await host.installationPaths?.()) ?? [];
-  const registrations = (await host.clientRegistrations?.()) ?? [];
+  const incomplete: DoctorCheck[] = [];
+  const probe = async <Value>(
+    name: string,
+    operation: () => Promise<Value>,
+  ): Promise<Value | undefined> => {
+    if (execution === undefined) return operation();
+    const result = await execution.probe(name, operation);
+    if (result.ok) return result.value;
+    incomplete.push(result.check);
+    return undefined;
+  };
+  // Establish selected registrations before optional installation-path discovery.
+  const registrationResult = await probe(
+    "registration:inspection",
+    () => host.clientRegistrations?.(execution?.signal) ?? Promise.resolve([]),
+  );
+  const registrations = registrationResult ?? [];
+  if (registrationResult === undefined)
+    incomplete.push(
+      ...scope.clients.map((client) => ({
+        ...incomplete[incomplete.length - 1]!,
+        name: `registration:${client}`,
+      })),
+    );
   const skillClientIds =
     scope.skill_clients ??
     (scope.mode === "audit-wide"
       ? registrations.map(({ client }) => client)
       : scope.clients);
-  const installedSkillIdentity =
-    await host.installedSkillIdentity?.(skillClientIds);
+  const installedSkillIdentity = await probe(
+    "skill:identity",
+    () =>
+      host.installedSkillIdentity?.(skillClientIds, execution?.signal) ??
+      Promise.resolve(undefined),
+  );
+  const skillInspected = !incomplete.some(
+    ({ name }) => name === "skill:identity",
+  );
+  const installationPaths =
+    (await probe(
+      "installation:paths",
+      () => host.installationPaths?.(execution?.signal) ?? Promise.resolve([]),
+    )) ?? [];
   const skillAligned = skillIdentityAligned(installedSkillIdentity);
   return {
+    registrations,
+    skillState:
+      installedSkillIdentity === undefined
+        ? "missing"
+        : skillAligned
+          ? "aligned"
+          : "stale",
     checks: [
-      ...(skillAligned ? [] : [skillIdentityCheck(installedSkillIdentity)]),
+      ...incomplete,
+      ...(skillAligned || !skillInspected
+        ? []
+        : [skillIdentityCheck(installedSkillIdentity)]),
       ...registrations
         .filter(
           (registration): registration is UnhealthyClientRegistrationStatus =>
@@ -302,22 +451,45 @@ const collectDoctorIdentity = async (
       },
       installations: {
         paths: installationPaths,
-        state: installationState(installationPaths),
+        state: incomplete.some(({ name }) => name === "installation:paths")
+          ? "unknown"
+          : installationState(installationPaths),
       },
       skill: {
         installed_version: installedSkillIdentity?.version ?? null,
         installed_tool_count: installedSkillIdentity?.toolCount ?? null,
-        state:
-          installedSkillIdentity === undefined
+        state: !skillInspected
+          ? "unknown"
+          : installedSkillIdentity === undefined
             ? "missing"
             : skillAligned
               ? "aligned"
               : "stale",
-        remediation: skillAligned
-          ? null
-          : "Run rea setup to update the installed REA skill.",
+        remediation: !skillInspected
+          ? "Rerun diagnosis to establish skill identity."
+          : skillAligned
+            ? null
+            : "Run rea setup to update the installed REA skill.",
       },
       registrations,
+      ...(incomplete.length === 0
+        ? {}
+        : {
+            observations: {
+              registrations:
+                registrationResult === undefined
+                  ? ("incomplete" as const)
+                  : ("completed" as const),
+              skill: skillInspected
+                ? ("completed" as const)
+                : ("incomplete" as const),
+              installations: incomplete.some(
+                ({ name }) => name === "installation:paths",
+              )
+                ? ("incomplete" as const)
+                : ("completed" as const),
+            },
+          }),
     },
   };
 };
@@ -363,10 +535,12 @@ export interface SystemDoctorHostOptions {
   readonly architecture?: NodeJS.Architecture;
   readonly environment?: NodeJS.ProcessEnv;
   readonly execFileOutput?: typeof execFileOutput;
-  readonly providerInspections?: () => Promise<
-    readonly DoctorProviderInspection[]
-  >;
-  readonly linuxDemoRuntimeCheck?: () => Promise<DoctorCheck>;
+  readonly providerInspections?: (
+    signal?: AbortSignal,
+  ) => Promise<readonly DoctorProviderInspection[]>;
+  readonly linuxDemoRuntimeCheck?: (
+    signal?: AbortSignal,
+  ) => Promise<DoctorCheck>;
 }
 
 /** Create diagnostics backed by the current process and host commands. */
@@ -391,8 +565,13 @@ export const systemDoctorHost = (
     ...(environment.REA_ILSPY_CMD_PATH === undefined
       ? {}
       : { configuredIlspyCmdPath: environment.REA_ILSPY_CMD_PATH }),
-    macosVersion: () =>
-      readMacosVersion(hostExecFileOutput, commandEnvironment),
+    macosVersion: (signal) =>
+      readMacosVersion(hostExecFileOutput, {
+        ...commandEnvironment,
+        ...(signal === undefined
+          ? {}
+          : { signal, stopSignal: "SIGTERM" as const }),
+      }),
     linuxDistribution: readLinuxDistribution,
     async validTarget(path) {
       return (
@@ -434,28 +613,29 @@ export const systemDoctorHost = (
         remediation: analysisErrorRemediationAction(error),
       };
     },
-    executable: (path) =>
-      executableAvailable(
-        path,
-        platform,
-        hostExecFileOutput,
-        commandEnvironment,
-      ),
+    executable: (path, signal) =>
+      executableAvailable(path, platform, hostExecFileOutput, {
+        ...commandEnvironment,
+        ...(signal === undefined
+          ? {}
+          : { signal, stopSignal: "SIGTERM" as const }),
+      }),
     linuxDemoRuntimeCheck:
       options.linuxDemoRuntimeCheck ?? uncomposedLinuxDemoRuntimeCheck,
     supportedLinuxHopper: linuxHopperBinarySupported,
-    async brewHopperPath() {
+    async brewHopperPath(signal) {
       return probeHomebrew(async (command) => {
         let caskroom: string;
         try {
           // Without a cask argument, `--caskroom` does not load Homebrew's
           // cask API, so doctor writes no Homebrew cache files.
           caskroom = (
-            await hostExecFileOutput(
-              command,
-              ["--caskroom"],
-              commandEnvironment,
-            )
+            await hostExecFileOutput(command, ["--caskroom"], {
+              ...commandEnvironment,
+              ...(signal === undefined
+                ? {}
+                : { signal, stopSignal: "SIGTERM" as const }),
+            })
           ).stdout.trim();
         } catch (cause: unknown) {
           // best-effort cleanup: optional Homebrew probing; absence means uninstalled.
@@ -476,13 +656,16 @@ export const systemDoctorHost = (
     ...(options.providerInspections === undefined
       ? {}
       : { providerInspections: options.providerInspections }),
-    async ilspyCmdVersion(path) {
+    async ilspyCmdVersion(path, signal) {
       try {
         await access(path, constants.X_OK);
         return firstIlspyVersionLine(
           (
             await hostExecFileOutput(path, ["--version"], {
               timeout: 10_000,
+              ...(signal === undefined
+                ? {}
+                : { signal, stopSignal: "SIGTERM" as const }),
               ...commandEnvironment,
             })
           ).stdout,
@@ -493,13 +676,19 @@ export const systemDoctorHost = (
         return undefined;
       }
     },
-    async installationPaths() {
+    async installationPaths(signal) {
       try {
         const command = platform === "win32" ? "where" : "which";
         const arguments_ = platform === "win32" ? ["rea"] : ["-a", "rea"];
         return uniqueLines(
-          (await hostExecFileOutput(command, arguments_, commandEnvironment))
-            .stdout,
+          (
+            await hostExecFileOutput(command, arguments_, {
+              ...commandEnvironment,
+              ...(signal === undefined
+                ? {}
+                : { signal, stopSignal: "SIGTERM" as const }),
+            })
+          ).stdout,
         );
       } catch (cause: unknown) {
         // best-effort cleanup: optional path probing; failure means none found.
@@ -534,7 +723,7 @@ export const systemDoctorHost = (
 
 const readMacosVersion = async (
   run: typeof execFileOutput,
-  options: { readonly env: NodeJS.ProcessEnv },
+  options: Parameters<typeof execFileOutput>[2],
 ): Promise<string | undefined> => {
   try {
     return (await run("sw_vers", ["-productVersion"], options)).stdout.trim();
@@ -549,7 +738,7 @@ const executableAvailable = async (
   path: string,
   platform: NodeJS.Platform,
   run: typeof execFileOutput,
-  options: { readonly env: NodeJS.ProcessEnv },
+  options: Parameters<typeof execFileOutput>[2],
 ): Promise<boolean> => {
   try {
     await access(path, constants.X_OK);

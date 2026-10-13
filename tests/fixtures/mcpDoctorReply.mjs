@@ -26,12 +26,20 @@ input.on("line", (line) => {
       };
       break;
     case "tools/list":
+      if (process.argv[3] === "tools-hang") return;
+      if (process.argv[3] === "tools-error") {
+        process.stdout.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "Catalog inspection failed" } })}\n`,
+        );
+        return;
+      }
       result = snapshot.tools;
       break;
     case "prompts/list":
       result = snapshot.prompts;
       break;
     case "tools/call":
+      if (process.argv[3] === "request-hang") return;
       if (request.params.name === "binary_session") result = reply;
       break;
     case "ping":

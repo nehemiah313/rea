@@ -1,3 +1,4 @@
+import type { DoctorExecution } from "./DoctorExecution.js";
 import {
   SUPPORTED_NODE_VERSION_PROSE,
   supportsNodeVersion,
@@ -24,25 +25,68 @@ export interface DoctorDiagnostics {
 export const collectDoctorDiagnostics = async (
   target: string | undefined,
   host: DoctorHost,
+  execution?: DoctorExecution,
 ): Promise<DoctorDiagnostics> => {
   const checks: DoctorCheck[] = [nodeCheck(host)];
-  checks.push(await hostCheck(host));
-
-  const hopperPath = await findHopper(host);
-  checks.push(hopperCheck(host, hopperPath));
-  const hopperVersionCheck = await optionalHopperVersionCheck(host, hopperPath);
-  if (hopperVersionCheck !== undefined) checks.push(hopperVersionCheck);
-
-  const providerInspections = await host.providerInspections?.();
+  const probe = async <Value>(
+    name: string,
+    operation: () => Promise<Value>,
+  ): Promise<Value | undefined> => {
+    if (execution === undefined) return operation();
+    const result = await execution.probe(name, operation);
+    if (result.ok) return result.value;
+    checks.push(result.check);
+    return undefined;
+  };
+  const add = (check: DoctorCheck | undefined): void => {
+    if (check !== undefined) checks.push(check);
+  };
+  // In bounded mode establish required target admission before optional probes.
+  if (execution?.bounded === true && target !== undefined)
+    add(
+      await probe("target", () =>
+        optionalTargetCheck(target, host, execution.signal),
+      ),
+    );
+  add(await probe("host", () => hostCheck(host, execution?.signal)));
+  const beforeHopper = checks.length;
+  const hopperPath = await probe("hopper", () =>
+    findHopper(host, execution?.signal),
+  );
+  if (checks.length === beforeHopper)
+    checks.push(hopperCheck(host, hopperPath));
+  if (host.platform === "linux" && hopperPath !== undefined)
+    add(
+      await probe("hopper-version", () =>
+        optionalHopperVersionCheck(host, hopperPath, execution?.signal),
+      ),
+    );
+  const providerInspections = await probe(
+    "provider:inspection",
+    () =>
+      host.providerInspections?.(execution?.signal) ??
+      Promise.resolve(undefined),
+  );
   if (providerInspections !== undefined)
     checks.push(...providerInspections.flatMap(providerDoctorChecks));
-
-  const ilspyCheck = await optionalIlspyCheck(host);
-  if (ilspyCheck !== undefined) checks.push(ilspyCheck);
-  const hopperDemoCheck = await optionalHopperDemoCheck(host, hopperPath);
-  if (hopperDemoCheck !== undefined) checks.push(hopperDemoCheck);
-  const targetCheck = await optionalTargetCheck(target, host);
-  if (targetCheck !== undefined) checks.push(targetCheck);
+  if (host.configuredIlspyCmdPath !== undefined)
+    add(
+      await probe("ilspycmd", () =>
+        optionalIlspyCheck(host, execution?.signal),
+      ),
+    );
+  if (host.platform === "linux" && hopperPath !== undefined)
+    add(
+      await probe("hopper-demo-runtime", () =>
+        optionalHopperDemoCheck(host, hopperPath, execution?.signal),
+      ),
+    );
+  if (execution?.bounded !== true)
+    add(
+      await probe("target", () =>
+        optionalTargetCheck(target, host, execution?.signal),
+      ),
+    );
 
   return {
     checks,
@@ -91,6 +135,33 @@ export const doctorHealthy = (
   );
 };
 
+/** Failed checks that participate in the existing audit health policy. */
+export const doctorBlockingChecks = (
+  checks: readonly DoctorCheck[],
+  providers: {
+    readonly hopperAvailable: boolean;
+    readonly hopperConfigured: boolean;
+    readonly providerInspections:
+      | readonly DoctorProviderInspection[]
+      | undefined;
+  },
+): readonly DoctorCheck[] => {
+  if (providers.providerInspections === undefined)
+    return checks.filter(({ ok }) => !ok);
+  const available =
+    providers.hopperAvailable ||
+    providers.providerInspections.some(({ available }) => available);
+  return checks.filter(({ name, ok }) => {
+    if (ok) return false;
+    if (name.startsWith("hopper"))
+      return providers.hopperConfigured || !available;
+    const provider = providers.providerInspections?.find(({ id }) =>
+      providerCheckName(id, name),
+    );
+    return provider === undefined || provider.configured || !available;
+  });
+};
+
 /** Bun passes when its reported Node.js compatibility version is supported. */
 const nodeCheck = ({ runtime }: DoctorHost): DoctorCheck => {
   const failure = {
@@ -122,11 +193,16 @@ const nodeCheck = ({ runtime }: DoctorHost): DoctorCheck => {
   };
 };
 
-const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
+const hostCheck = async (
+  host: DoctorHost,
+  signal?: AbortSignal,
+): Promise<DoctorCheck> => {
   const macosVersion =
-    host.platform === "darwin" ? await host.macosVersion() : undefined;
+    host.platform === "darwin" ? await host.macosVersion(signal) : undefined;
   const linuxDistribution =
-    host.platform === "linux" ? await host.linuxDistribution() : undefined;
+    host.platform === "linux"
+      ? await host.linuxDistribution(signal)
+      : undefined;
   const supported =
     (host.platform === "darwin" && parseMajor(macosVersion) >= 12) ||
     (host.platform === "linux" && linuxDistribution?.supported === true) ||
@@ -143,32 +219,37 @@ const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
   });
 };
 
-const findHopper = async (host: DoctorHost): Promise<string | undefined> => {
+const findHopper = async (
+  host: DoctorHost,
+  signal?: AbortSignal,
+): Promise<string | undefined> => {
   const candidates =
     host.configuredHopperPath === undefined
       ? [
           DEFAULT_HOPPER,
           SYSTEM_LINUX_HOPPER,
           linuxHopperLauncherPath(host.homeDirectory),
-          ...(await host.manualHopperPaths()),
+          ...(await host.manualHopperPaths(signal)),
         ]
       : [host.configuredHopperPath];
-  const hopperPath = await firstExecutable(host, candidates);
+  const hopperPath = await firstExecutable(host, candidates, signal);
   if (hopperPath !== undefined || host.configuredHopperPath !== undefined)
     return hopperPath;
-  const brewCandidate = await host.brewHopperPath();
+  const brewCandidate = await host.brewHopperPath(signal);
   return firstExecutable(
     host,
     brewCandidate === undefined ? [] : [brewCandidate],
+    signal,
   );
 };
 
 const firstExecutable = async (
   host: DoctorHost,
   candidates: readonly string[],
+  signal?: AbortSignal,
 ): Promise<string | undefined> => {
   for (const candidate of new Set(candidates))
-    if (await host.executable(candidate)) return candidate;
+    if (await host.executable(candidate, signal)) return candidate;
   return undefined;
 };
 
@@ -195,11 +276,12 @@ const hopperCheck = (
 const optionalHopperVersionCheck = async (
   host: DoctorHost,
   hopperPath: string | undefined,
+  signal?: AbortSignal,
 ): Promise<DoctorCheck | undefined> => {
   if (host.platform !== "linux" || hopperPath === undefined) return undefined;
   return check(
     "hopper-version",
-    await host.supportedLinuxHopper(hopperPath),
+    await host.supportedLinuxHopper(hopperPath, signal),
     hopperPath,
     {
       remediation: unsupportedHopperRemediation(
@@ -213,16 +295,21 @@ const optionalHopperVersionCheck = async (
 const optionalHopperDemoCheck = async (
   host: DoctorHost,
   hopperPath: string | undefined,
+  signal?: AbortSignal,
 ): Promise<DoctorCheck | undefined> =>
   host.platform !== "linux" || hopperPath === undefined
     ? undefined
-    : host.linuxDemoRuntimeCheck();
+    : host.linuxDemoRuntimeCheck(signal);
 
 const optionalIlspyCheck = async (
   host: DoctorHost,
+  signal?: AbortSignal,
 ): Promise<DoctorCheck | undefined> => {
   if (host.configuredIlspyCmdPath === undefined) return undefined;
-  const version = await host.ilspyCmdVersion?.(host.configuredIlspyCmdPath);
+  const version = await host.ilspyCmdVersion?.(
+    host.configuredIlspyCmdPath,
+    signal,
+  );
   return check(
     "ilspycmd",
     version !== undefined,
@@ -240,12 +327,13 @@ const optionalIlspyCheck = async (
 const optionalTargetCheck = async (
   target: string | undefined,
   host: DoctorHost,
+  signal?: AbortSignal,
 ): Promise<DoctorCheck | undefined> =>
   target === undefined
     ? undefined
     : host.inspectTarget !== undefined
-      ? host.inspectTarget(target)
-      : check("target", await host.validTarget(target), target, {
+      ? host.inspectTarget(target, signal)
+      : check("target", await host.validTarget(target, signal), target, {
           remediation: "Supply a readable local app or program path.",
           classification: "config_drift",
         });

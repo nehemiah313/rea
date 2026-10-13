@@ -1,6 +1,7 @@
-import { describe, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { workspaceCliTest } from "../../support/cli/workspaceCliFixture.js";
+import { parseMcpDoctorArguments } from "../../../src/mcpDoctor.js";
 
 const CLI_INTEGRATION_TIMEOUT_MS = 60_000;
 
@@ -19,6 +20,10 @@ describe("MCP doctor help boundary", () => {
         expect(result.stdout).toContain("Usage: rea mcp doctor [options]");
         expect(result.stdout).toContain("--format <toon|json|yaml|md|jsonl>");
         expect(result.stdout).toContain("--full-output");
+        expect(result.stdout).toContain("--summary");
+        expect(result.stdout).toContain("--failures-only");
+        expect(result.stdout).toContain("--human");
+        expect(result.stdout).toContain("--deadline-ms <number>");
         // Help returns before the diagnostic session starts, so no report
         // envelope and no startup diagnostics are produced.
         expect(result.stdout).not.toContain("healthy");
@@ -59,6 +64,16 @@ describe("MCP doctor help boundary", () => {
         expect(result.stdout).toContain("Invalid output format:");
         expect(result.stdout).not.toContain("Usage: rea mcp doctor");
       }
+      for (const arguments_ of [
+        ["mcp", "doctor", "--deadline-ms", "--help"],
+        ["mcp", "doctor", "--deadline-ms", "-h"],
+        ["mcp", "doctor", "--deadline-ms=--help"],
+      ]) {
+        const result = await cli.run({ arguments: arguments_ });
+        expect(result).toMatchObject({ exitCode: 1 });
+        expect(result.stdout).toContain("Invalid --deadline-ms value:");
+        expect(result.stdout).not.toContain("Usage: rea mcp doctor");
+      }
     },
     CLI_INTEGRATION_TIMEOUT_MS,
   );
@@ -83,4 +98,76 @@ describe("MCP doctor help boundary", () => {
     },
     CLI_INTEGRATION_TIMEOUT_MS,
   );
+});
+
+describe("MCP doctor canonical option parser", () => {
+  it("preserves bare and explicit boolean values while rejecting invalid explicit booleans", () => {
+    expect(parseMcpDoctorArguments(["--summary"])).toMatchObject({
+      ok: true,
+      summary: true,
+      failuresOnly: false,
+    });
+    expect(
+      parseMcpDoctorArguments([
+        "--summary=false",
+        "--failures-only=true",
+        "--full-output=false",
+      ]),
+    ).toMatchObject({
+      ok: true,
+      summary: false,
+      failuresOnly: true,
+      fullOutput: false,
+    });
+    for (const argument of [
+      "--summary=invalid",
+      "--failures-only=1",
+      "--human=",
+      "--json=YES",
+    ])
+      expect(parseMcpDoctorArguments([argument])).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("Invalid boolean value"),
+      });
+  });
+
+  it("accepts only a positive integer deadline and keeps its value from help", () => {
+    expect(parseMcpDoctorArguments(["--deadline-ms", "17"])).toMatchObject({
+      ok: true,
+      deadlineMs: 17,
+    });
+    for (const argument of ["0", "-1", "1.5", "NaN", ""])
+      expect(
+        parseMcpDoctorArguments(["--deadline-ms", argument]),
+      ).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("positive integer"),
+      });
+    expect(parseMcpDoctorArguments(["--deadline-ms", "--help"])).toMatchObject({
+      ok: false,
+      help: false,
+      message: expect.any(String),
+    });
+    expect(parseMcpDoctorArguments(["--help", "--deadline-ms", "17"])).toEqual({
+      ok: false,
+      help: true,
+    });
+  });
+
+  it("rejects human rendering with every explicit machine-output selector before diagnostic work", () => {
+    for (const arguments_ of [
+      ["--human", "--format", "toon"],
+      ["--human", "--json=false"],
+      ["--human", "--full-output=false"],
+    ])
+      expect(parseMcpDoctorArguments(arguments_)).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("--human cannot be combined"),
+      });
+    expect(parseMcpDoctorArguments(["--human", "--summary"])).toMatchObject({
+      ok: true,
+      human: true,
+      summary: true,
+    });
+  });
 });

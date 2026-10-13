@@ -14,11 +14,12 @@ export const createSystemDoctorHost = (
 ): DoctorHost =>
   systemDoctorHost({
     environment,
-    providerInspections: async () => [
-      await inspectSystemGhidraProvider(environment),
+    providerInspections: async (signal) => [
+      await inspectSystemGhidraProvider(environment, signal),
       inspectIdaRegistration(environment.REA_IDA_MCP_CONFIG),
     ],
-    linuxDemoRuntimeCheck: () => inspectLinuxPrivateDisplay(environment),
+    linuxDemoRuntimeCheck: (signal) =>
+      inspectLinuxPrivateDisplay(environment, signal),
   });
 
 const HOPPER_DEMO_HELPER_PATH = fileURLToPath(
@@ -27,10 +28,12 @@ const HOPPER_DEMO_HELPER_PATH = fileURLToPath(
 
 const inspectLinuxPrivateDisplay = async (
   environment: Readonly<NodeJS.ProcessEnv>,
+  signal?: AbortSignal,
 ): Promise<DoctorCheck> => {
   const selection = await selectLinuxPrivateDisplayStrategy({
     helperPath: HOPPER_DEMO_HELPER_PATH,
     environment,
+    ...(signal === undefined ? {} : { signal }),
   });
   const value = selection.diagnostic;
   const detail = [
