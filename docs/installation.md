@@ -148,6 +148,31 @@ A scoped report has `scope.mode: "explicit"`. Its `scope_checks` determine
 `environment_healthy` summarizes the full audit. `--target` adds a target check,
 but the report remains audit-wide unless a scope option is also supplied.
 
+### Compact diagnostic reports
+
+Use `--summary` for a small readiness response, or `--failures-only` to retain
+only failed checks with their original details and remediation:
+
+```bash
+rea doctor --client codex --summary --json
+rea doctor --provider ghidra --failures-only --json
+```
+
+Both views retain `healthy`, `environment_healthy` and `scope`. Their
+`check_counts.scope` and `check_counts.informational` contain `total`, `passed`
+and `failed` counts from the unfiltered report. `report_view` identifies the
+selected view. Summary reports omit diagnostic arrays and installation identity;
+failure-only reports include filtered `scope_checks` and `informational_checks`
+without the duplicate full-audit `checks` array.
+
+An empty `scope_checks` array in a failure-only report means no required checks
+failed, not that no checks ran. Informational failures remain visible but do not
+change a healthy explicit scope's exit status. If both flags are supplied,
+`--failures-only` takes precedence and still includes summary counts. These flags
+change presentation only: all normal probes and cleanup still run, no host
+configuration is changed, and exit statuses are unchanged. Omit both flags to
+retrieve the complete original report and identity observations.
+
 Follow the remediation for the failed check. If a native target has several
 available providers, choose one with `--provider` on the CLI or `provider_id`
 on `open_binary`. A `capability_unavailable` failure carries

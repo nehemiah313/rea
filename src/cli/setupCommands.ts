@@ -2,6 +2,7 @@ import { z } from "incur";
 
 import type { DoctorScope } from "../application/Doctor.js";
 import { DOCTOR_PROVIDER_IDS } from "../application/DoctorProviderIds.js";
+import { projectDoctorReport } from "../application/DoctorReportView.js";
 import {
   isSetupFailure,
   type SetupOptions,
@@ -118,6 +119,16 @@ const registerDoctorCommand = (
         .boolean()
         .optional()
         .describe("Require the installed REA skill identity to be aligned"),
+      summary: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Return readiness status and check counts without diagnostics",
+        ),
+      failuresOnly: z
+        .boolean()
+        .default(false)
+        .describe("Return only failed checks with remediation and full counts"),
     }),
     run: ({ options }) =>
       logCliCommand(logger, "doctor", async () => {
@@ -126,11 +137,12 @@ const registerDoctorCommand = (
             import("../application/Doctor.js"),
             import("../doctorRuntime.js"),
           ]);
-        return runDoctorOwned(
+        const report = await runDoctorOwned(
           options.target,
           createSystemDoctorHost(environment),
           doctorScope(options),
         );
+        return projectDoctorReport(report, options);
       }),
   });
 };
